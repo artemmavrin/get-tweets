@@ -1,18 +1,83 @@
 """Listen for tweets with specific keywords, and scrape 'em."""
 
-from typing import Iterable
+import datetime
+import os
+import pathlib
+from typing import Iterable, List, Optional, Union
 
 import pandas as pd
-import tqdm
 import tweepy
 
 
-class TweetListener(tweepy.StreamListener):
-    def __init__(self, max_tweets: int):
+def listen_for_words(auth: tweepy.OAuthHandler,
+                     words: Iterable[str],
+                     save_dir: Union[str, pathlib.Path],
+                     max_tweets: Optional[int] = None,
+                     max_records_per_file: int = 100000,
+                     ) -> List[str]:
+    """Stream and save tweets containing certain keywords.
+
+    Parameters
+    ----------
+    auth : tweepy.OAuthHandler
+        An OAuth authentication handler for the Twitter API.
+
+    words : iterable of str
+        Iterable (e.g., list) of words to use as tweet keywords.
+
+    save_dir : str or path-like
+        Path to a directory where the tweet data will be saved. Saved tweets are
+        stored as gzipped pickled pandas DataFrames.
+
+    max_tweets : int, optional
+        Maximum number of tweets to stream. If not provided, tweets will be
+        streamed and saved to disk indefinitely (until either the Twitter API
+        rejects or the disk is full). If this number is provided and the tqdm
+        package is installed, a progress bar will be displayed while the tweets
+        are streamed.
+
+    max_records_per_file : int
+        Maximum number of rows per saved DataFrame file.
+
+    Returns
+    -------
+    list of str
+        List of filenames where gzipped pickled pandas DataFrames were saved.
+        Data can then be loaded with pandas.read_pickle().
+
+    """
+    listener = _TweetListener(save_dir=save_dir, max_tweets=max_tweets,
+                              max_records_per_file=max_records_per_file)
+    stream = tweepy.Stream(auth=auth, listener=listener)
+    stream.filter(track=words)
+    return listener.files
+
+
+class _TweetListener(tweepy.StreamListener):
+    def __init__(self,
+                 save_dir: Union[str, pathlib.Path],
+                 max_tweets: Optional[int] = None,
+                 max_records_per_file: int = 100000):
         super().__init__()
-        self.tweets = []
+
         self.max_tweets = max_tweets
-        self.progress_bar = tqdm.tqdm(total=self.max_tweets)
+        self.save_dir = save_dir
+        self.max_records_per_file = max_records_per_file
+
+        if max_tweets is not None:
+            try:
+                import tqdm
+            except ModuleNotFoundError:
+                self.progress_bar = None
+            else:
+                self.progress_bar = tqdm.tqdm(total=max_tweets)
+        else:
+            self.progress_bar = None
+
+        self.tweets = []
+        self.tweet_count = 0
+
+        self.files = []
 
     @staticmethod
     def _get_tweet_text(status):
@@ -21,6 +86,14 @@ class TweetListener(tweepy.StreamListener):
             return tweet.extended_tweet['full_text']
         except AttributeError:
             return tweet.text
+
+    def _save_tweets(self):
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')
+        filename = 'tweets_' + timestamp + '.pkl.gz'
+        filename = os.path.join(self.save_dir, filename)
+        self.df.to_pickle(filename)
+        self.files.append(filename)
+        self.tweets = []
 
     def on_status(self, status):
         record = dict(
@@ -39,20 +112,26 @@ class TweetListener(tweepy.StreamListener):
             text=self._get_tweet_text(status),
         )
         self.tweets.append(record)
+        self.tweet_count += 1
 
-        self.progress_bar.update()
-        if len(self.tweets) >= self.max_tweets:
-            self.progress_bar.close()
+        if len(self.tweets) >= self.max_records_per_file:
+            self._save_tweets()
+
+        if self.progress_bar is not None:
+            self.progress_bar.update()
+
+        if self.max_tweets is not None and self.tweet_count >= self.max_tweets:
+            if self.tweets:
+                self._save_tweets()
+
+            if self.progress_bar is not None:
+                self.progress_bar.close()
+
             return False
 
     @property
     def df(self) -> pd.DataFrame:
-        return pd.DataFrame.from_records(self.tweets, index='id')
-
-
-def listen_for_words(auth: tweepy.OAuthHandler, words: Iterable[str],
-                     max_tweets: int = 1000) -> pd.DataFrame:
-    listener = TweetListener(max_tweets=max_tweets)
-    stream = tweepy.Stream(auth=auth, listener=listener)
-    stream.filter(track=words)
-    return listener.df
+        try:
+            return pd.DataFrame.from_records(self.tweets, index='id')
+        except KeyError:
+            return pd.DataFrame.from_records(self.tweets)
