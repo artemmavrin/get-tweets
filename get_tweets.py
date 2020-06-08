@@ -3,6 +3,8 @@
 import datetime
 import os
 import pathlib
+import sys
+import traceback
 from typing import Iterable, List, Optional, Union
 
 import pandas as pd
@@ -49,7 +51,15 @@ def listen_for_words(auth: tweepy.OAuthHandler,
     listener = _TweetListener(save_dir=save_dir, max_tweets=max_tweets,
                               max_records_per_file=max_records_per_file)
     stream = tweepy.Stream(auth=auth, listener=listener)
-    stream.filter(track=words)
+
+    try:
+        stream.filter(track=words)
+    except:
+        e_type, e, tb = sys.exc_info()
+        print('Listening prematurely terminated by exception:', file=sys.stderr)
+        print(f'{e_type.__name__}: {e}', file=sys.stderr)
+        traceback.print_tb(tb, file=sys.stderr)
+
     return listener.files
 
 
